@@ -1,6 +1,7 @@
 # app.py
 # Talep Tahminleme + Kapasite Planlama
 # Modeller: Lineer Regresyon (LR) + Ağırlıklı Hareketli Ortalama (WMA)
+# Ürün bazlı tahmin: depo bağımsız, aynı ürüne ait tüm depolar toplanır.
 # Girdi: talep.xlsx (name=file, zorunlu) + kapasite.xlsx (name=capfile, opsiyonel)
 # UI: templates/index.html (Chart.js frontend)
 
@@ -16,30 +17,33 @@ from sklearn.linear_model import LinearRegression
 warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB dosya limiti
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
 
 _LAST_CSV_BYTES = None  # son CSV cache
 
 # ----------------- IO -----------------
-def read_excel_file(file_storage, col_date, col_demand):
+def read_excel_file(file_storage, col_date, col_demand, col_depo, col_urun):
     try:
         df = pd.read_excel(file_storage)
     except Exception as e:
         abort(400, f"XLSX okunamadı: {e}")
-
     df.columns = df.columns.str.strip().str.lower()
-    col_date = col_date.lower()
-    col_demand = col_demand.lower()
 
+    # temel kolonlar
     for c in [col_date, col_demand]:
         if c not in df.columns:
             abort(400, f"Gerekli sütun yok: {c}")
 
+    # opsiyoneller yoksa ekle
+    if col_depo and col_depo not in df.columns:
+        df[col_depo] = np.nan
+    if col_urun and col_urun not in df.columns:
+        abort(400, f"Ürün bazlı tahmin için '{col_urun}' sütunu gerekli.")
+
     df[col_date] = pd.to_datetime(df[col_date], errors="coerce")
     df[col_demand] = pd.to_numeric(df[col_demand], errors="coerce")
-    df = df.dropna(subset=[col_date, col_demand])
+    df = df.dropna(subset=[col_date, col_demand, col_urun])
     return df
-
 
 def read_capacity_excel(cap_storage):
     if not cap_storage:
@@ -50,17 +54,27 @@ def read_capacity_excel(cap_storage):
         abort(400, f"Kapasite XLSX okunamadı: {e}")
 
     cap.columns = cap.columns.str.strip().str.lower()
-    cap_depo = next((c for c in ["depo", "warehouse", "site"] if c in cap.columns), None)
-    cap_kap = next((c for c in ["kapasite", "capacity"] if c in cap.columns), None)
-    cap_urun = "urun" if "urun" in cap.columns else None
-    if not cap_depo or not cap_kap:
-        abort(400, "Kapasite dosyasında gerekli kolonlar yok (depo ve kapasite).")
+    # desteklenen kolon kombinasyonları:
+    # 1) urun + kapasite   (ürün toplam kapasitesi)
+    # 2) depo + urun + kapasite  (depo bazında, sonradan ürün toplamına toplanır)
+    # 3) depo + kapasite (ürün yoksa ürün toplamına çevrilemez -> kullanılmaz)
+    kap_col = next((c for c in ["kapasite", "capacity"] if c in cap.columns), None)
+    if kap_col is None:
+        abort(400, "Kapasite dosyasında 'kapasite' veya 'capacity' kolonu yok.")
 
-    cols = [cap_depo, cap_kap] + ([cap_urun] if cap_urun else [])
-    cap = cap[cols].copy()
-    rename = {cap_depo: "depo", cap_kap: "kapasite"}
-    if cap_urun: rename[cap_urun] = "urun"
-    return cap.rename(columns=rename)
+    has_urun = "urun" in cap.columns
+    has_depo = "depo" in cap.columns
+
+    if has_urun and has_depo:
+        out = cap[["urun", kap_col]].groupby("urun", as_index=False).sum().rename(columns={kap_col: "kapasite"})
+    elif has_urun:
+        out = cap[["urun", kap_col]].rename(columns={kap_col: "kapasite"})
+    else:
+        # ürün kolonu yoksa ürün bazlı kapasiteler üretilemez
+        return pd.DataFrame(columns=["urun", "kapasite"])
+
+    out["urun"] = out["urun"].astype(str)
+    return out[["urun", "kapasite"]]
 
 # ----------------- Zaman Serisi Yardımcıları -----------------
 def infer_freq(dates: pd.Series, fallback="M"):
@@ -81,7 +95,6 @@ def fit_predict_lr(y: np.ndarray, h: int):
     n = len(y)
     X = np.arange(n).reshape(-1, 1)
     m = LinearRegression().fit(X, y.astype(float))
-    # Çok adımlı ileri tahmin
     X_fut = np.arange(n, n + h).reshape(-1, 1)
     return m.predict(X_fut).tolist()
 
@@ -90,7 +103,6 @@ def predict_wma(y: np.ndarray, h: int, window: int = 3, weights: np.ndarray | No
         window = 3
     y_list = list(y.astype(float))
     if weights is None:
-        # lineer ağırlıklar: 1..window
         weights = np.arange(1, window + 1, dtype=float)
     else:
         weights = np.array(weights, dtype=float)
@@ -100,71 +112,60 @@ def predict_wma(y: np.ndarray, h: int, window: int = 3, weights: np.ndarray | No
 
     preds = []
     for _ in range(h):
-        src = y_list[-window:] if len(y_list) >= window else ( [y_list[-1]] * (window - len(y_list)) + y_list )
+        src = y_list[-window:] if len(y_list) >= window else ([y_list[-1]] * (window - len(y_list)) + y_list)
         val = float(np.dot(src[-window:], w))
         preds.append(val)
         y_list.append(val)
     return preds
 
-# ----------------- Pipeline -----------------
+# ----------------- Pipeline (ÜRÜN BAZLI) -----------------
 def run_pipeline(xlsx_file, capfile, h, col_date, col_demand, col_depo, col_urun, wma_window):
-    df = read_excel_file(xlsx_file, col_date, col_demand)
-    # grup kolonlarını normalize et
-    group_cols = [c for c in [col_depo, col_urun] if c and c in df.columns]
-    grouped = df.groupby(group_cols, dropna=False) if group_cols else [(("serie",), df.assign(_grp="serie"))]
+    df = read_excel_file(xlsx_file, col_date, col_demand, col_depo, col_urun)
 
-    cap_df = read_capacity_excel(capfile) if capfile else pd.DataFrame()
+    # Ürün bazlı: aynı ürüne ait tüm depolar toplanır
+    # Gün/hafta/ay bazında 'tarih, urun' kırılımında talep toplamı
+    agg = (
+        df[[col_date, col_urun, col_demand]]
+        .groupby([col_urun, col_date], as_index=False)
+        .sum(numeric_only=True)
+        .rename(columns={col_urun: "urun", col_date: "tarih", col_demand: "talep"})
+    )
+
+    cap_df = read_capacity_excel(capfile) if capfile else pd.DataFrame()  # kolonlar: urun, kapasite
 
     outs = []
-    for keys, g in grouped if isinstance(grouped, list) else grouped:
-        # tarih sırası
-        g = g.sort_values(col_date)
-        y = g[col_demand].to_numpy(dtype=float)
+    for urun, g in agg.groupby("urun", as_index=False):
+        g = g.sort_values("tarih")
+        y = g["talep"].to_numpy(dtype=float)
         if len(y) < 2:
+            # tek nokta/eksik seri atla
             continue
 
-        # Tahminler
         lr = fit_predict_lr(y, h)
         wma = predict_wma(y, h, window=wma_window)
-        # tarihleri oluştur
-        fut_idx = next_index(g[col_date].iloc[-1], h, g[col_date])
+        fut_idx = next_index(g["tarih"].iloc[-1], h, g["tarih"])
 
         out = pd.DataFrame({
             "tarih": fut_idx,
+            "urun": urun,
             "linreg": lr,
             "wma": wma,
         })
         out["tahmin_mean"] = out[["linreg", "wma"]].mean(axis=1)
-
-        # grup anahtarlarını yaz
-        if group_cols:
-            if isinstance(keys, tuple):
-                for name, val in zip(group_cols, keys):
-                    out[name] = val
-            else:
-                out[group_cols[0]] = keys
-        else:
-            out["_grp"] = "serie"
-
         outs.append(out)
 
     if not outs:
-        abort(400, "Yeterli veri yok.")
+        abort(400, "Yeterli veri yok veya 'urun' sütunu boş.")
 
     res = pd.concat(outs, ignore_index=True)
 
-    # kapasite merge
+    # Kapasiteyi ürün seviyesinde birleştir
     if not cap_df.empty:
-        keys = []
-        if col_depo and col_depo in res.columns: keys.append((col_depo, "depo"))
-        if col_urun and col_urun in res.columns and "urun" in cap_df.columns: keys.append((col_urun, "urun"))
-        if keys:
-            left_on = [k[0] for k in keys]; right_on = [k[1] for k in keys]
-            res = res.merge(cap_df, how="left", left_on=left_on, right_on=right_on)
-            res["kullanim_orani"] = res["tahmin_mean"] / res["kapasite"]
+        res = res.merge(cap_df, how="left", on="urun")
+        res["kullanim_orani"] = res["tahmin_mean"] / res["kapasite"]
 
     # sütun sırası
-    lead = [c for c in ["tarih", col_depo, col_urun] if c and c in res.columns] or ["tarih"]
+    lead = ["tarih", "urun"]
     ordered = lead + [c for c in ["linreg", "wma", "tahmin_mean", "kapasite", "kullanim_orani"] if c in res.columns]
     other = [c for c in res.columns if c not in ordered]
     res = res[ordered + other]
@@ -186,11 +187,13 @@ def forecast_endpoint():
     capfile = request.files.get("capfile")  # opsiyonel
 
     h = int(request.form.get("h", "12"))
+    wma_window = int(request.form.get("wma_window", "3"))
+
+    # kolon isimleri
     col_date = (request.form.get("col_date", "tarih") or "tarih").strip().lower()
     col_demand = (request.form.get("col_demand", "talep") or "talep").strip().lower()
-    col_depo = (request.form.get("col_depo", "depo") or "").strip().lower() or None
-    col_urun = (request.form.get("col_urun", "urun") or "").strip().lower() or None
-    wma_window = int(request.form.get("wma_window", "3"))
+    col_depo = (request.form.get("col_depo", "depo") or "").strip().lower() or "depo"
+    col_urun = (request.form.get("col_urun", "urun") or "urun").strip().lower()
 
     res_df, cap_df = run_pipeline(file, capfile, h, col_date, col_demand, col_depo, col_urun, wma_window)
 
