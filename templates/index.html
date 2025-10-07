@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Talep Tahminleme + Kapasite Planlama</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body{background:var(--bs-body-bg)}
-    .nowrap{white-space:nowrap}
-    .table-responsive{max-height:60vh}
-    .chart-box{margin-top:12px}
+    body { background: var(--bs-body-bg); }
+    .chart-box { margin-top:20px; }
+    .nowrap { white-space:nowrap; }
+    .table-responsive { max-height: 60vh; }
   </style>
 </head>
 <body>
@@ -18,7 +18,7 @@
     <div class="container-fluid">
       <span class="navbar-brand fw-semibold">Eti Maden · Tahmin & Kapasite</span>
       <div class="d-flex gap-2 ms-auto">
-        <a class="btn btn-outline-primary btn-sm" href="/download_last.csv" target="_blank">CSV indir</a>
+        <a class="btn btn-outline-primary btn-sm" id="csvBtn" href="/download_last.csv" target="_blank">CSV indir</a>
         <button class="btn btn-outline-secondary btn-sm" id="themeBtn" type="button">Tema</button>
       </div>
     </div>
@@ -33,47 +33,39 @@
             <h5 class="mb-3">Veri Yükle</h5>
             <form id="form">
               <div class="mb-3">
-                <label class="form-label">Talep (.xlsx) <span class="text-danger">*</span></label>
+                <label class="form-label">Talep dosyası (.xlsx)</label>
                 <input class="form-control" type="file" name="file" accept=".xlsx" required>
-                <div class="form-text">Kolonlar: <code>tarih, talep</code>. Ops.: <code>depo, urun</code></div>
+                <div class="form-text">Kolonlar: <code>tarih</code>, <code>talep</code></div>
               </div>
               <div class="mb-3">
-                <label class="form-label">Kapasite (.xlsx) (opsiyonel)</label>
+                <label class="form-label">Kapasite dosyası (.xlsx) (opsiyonel)</label>
                 <input class="form-control" type="file" name="capfile" accept=".xlsx">
               </div>
               <div class="row g-2">
                 <div class="col">
-                  <label class="form-label">Ufuk (h)</label>
+                  <label class="form-label">Tahmin ufku (h)</label>
                   <input class="form-control" type="number" name="h" value="12" min="1">
                 </div>
-                <div class="col">
-                  <label class="form-label">Mevsimsellik (s)</label>
-                  <input class="form-control" type="number" name="s" value="12" min="1">
-                </div>
-              </div>
-              <div class="row g-2 mt-2">
                 <div class="col">
                   <label class="form-label">Tarih sütunu</label>
                   <input class="form-control" type="text" name="col_date" value="tarih">
                 </div>
+              </div>
+              <div class="row g-2 mt-2">
                 <div class="col">
                   <label class="form-label">Talep sütunu</label>
                   <input class="form-control" type="text" name="col_demand" value="talep">
                 </div>
-              </div>
-              <div class="row g-2 mt-2">
                 <div class="col">
                   <label class="form-label">Depo sütunu</label>
                   <input class="form-control" type="text" name="col_depo" value="depo">
                 </div>
+              </div>
+              <div class="row g-2 mt-2">
                 <div class="col">
                   <label class="form-label">Ürün sütunu</label>
                   <input class="form-control" type="text" name="col_urun" value="urun">
                 </div>
-              </div>
-              <div class="mt-2">
-                <label class="form-label">Frekans (opsiyonel)</label>
-                <input class="form-control" type="text" name="freq" placeholder="M, MS, W, D">
               </div>
               <div class="d-grid mt-3">
                 <button class="btn btn-primary" type="submit">Çalıştır</button>
@@ -89,20 +81,19 @@
         <div class="card shadow-sm">
           <div class="card-body">
             <h5 class="mb-3">Sonuç</h5>
-            <div id="badges" class="mb-2 d-none">
+            <div id="badges" class="mb-3 d-none">
               <span id="capBadge" class="badge text-bg-secondary me-2">Kapasite</span>
               <span id="countBadge" class="badge text-bg-info">Kayıt</span>
             </div>
 
+            <!-- Chart -->
             <div class="chart-box d-none">
-              <canvas id="chartForecast" height="120"></canvas>
-            </div>
-            <div class="chart-box d-none" id="utilBox">
-              <canvas id="chartUtil" height="120"></canvas>
+              <canvas id="chart"></canvas>
             </div>
 
+            <!-- Table -->
             <div class="table-responsive d-none mt-3" id="tableWrap">
-              <table class="table table-sm table-striped align-middle">
+              <table class="table table-sm table-striped">
                 <thead id="thead"></thead>
                 <tbody id="tbody"></tbody>
               </table>
@@ -123,31 +114,9 @@
     const thead=document.getElementById('thead');
     const tbody=document.getElementById('tbody');
     const chartBox=document.querySelector('.chart-box');
-    const utilBox=document.getElementById('utilBox');
-    const ctxForecast=document.getElementById('chartForecast');
-    const ctxUtil=document.getElementById('chartUtil');
-    let chartF=null, chartU=null;
+    const ctx=document.getElementById('chart');
 
-    function aggByDate(rows, keys){
-      const map=new Map(); // date -> {key:value}
-      for(const r of rows){
-        const d=r.tarih;
-        if(!map.has(d)) map.set(d, {});
-        const obj=map.get(d);
-        for(const k of keys){
-          const v=Number(r[k]);
-          if(!isNaN(v)) obj[k]=(obj[k]||0)+v;
-        }
-      }
-      // sort dates
-      const labels=[...map.keys()].sort((a,b)=>new Date(a)-new Date(b));
-      const series={}; keys.forEach(k=>series[k]=[]);
-      for(const d of labels){
-        const o=map.get(d)||{};
-        keys.forEach(k=>series[k].push(o[k]??0));
-      }
-      return {labels, series};
-    }
+    let chartInstance=null;
 
     form.addEventListener('submit', async e=>{
       e.preventDefault();
@@ -155,10 +124,9 @@
       badges.classList.add('d-none');
       tableWrap.classList.add('d-none');
       chartBox.classList.add('d-none');
-      utilBox.classList.add('d-none');
 
+      const fd=new FormData(form);
       try{
-        const fd=new FormData(form);
         const res=await fetch('/forecast',{method:'POST',body:fd});
         if(!res.ok) throw new Error(await res.text());
         const json=await res.json();
@@ -175,78 +143,25 @@
         tbody.innerHTML=rows.map(r=>"<tr>"+cols.map(c=>`<td>${r[c]??""}</td>`).join("")+"</tr>").join("");
         tableWrap.classList.remove('d-none');
 
-        // Forecast chart (aggregate by date)
-        const modelCols=["linreg","sarima","wma","tahmin_mean"].filter(c=>cols.includes(c));
-        if(modelCols.length){
-          const agg=aggByDate(rows, modelCols);
-          const palette={
-            linreg:"rgba(13,110,253,0.9)",
-            sarima:"rgba(25,135,84,0.9)",
-            wma:"rgba(255,193,7,0.9)",
-            tahmin_mean:"rgba(220,53,69,0.9)"
-          };
-          const datasets=modelCols.map(k=>({
-            label:k.toUpperCase(),
-            data:agg.series[k],
-            borderColor:palette[k]||undefined,
-            backgroundColor:palette[k]||undefined,
-            pointRadius:0,
-            tension:0.25
-          }));
-          if(chartF) chartF.destroy();
-          chartF=new Chart(ctxForecast,{
+        // Grafik (linreg değerleri varsa)
+        if(cols.includes("linreg")){
+          const labels=rows.map(r=>r["tarih"]);
+          const values=rows.map(r=>r["linreg"]);
+          if(chartInstance){chartInstance.destroy();}
+          chartInstance=new Chart(ctx,{
             type:'line',
-            data:{labels:agg.labels,datasets},
-            options:{
-              responsive:true,
-              interaction:{mode:'index',intersect:false},
-              plugins:{legend:{position:'top'}},
-              scales:{x:{ticks:{maxRotation:0,autoSkip:true}}}
-            }
+            data:{ labels:labels, datasets:[{label:"Tahmin (LinReg)",data:values,borderColor:"blue",tension:0.3}] },
+            options:{ responsive:true, plugins:{legend:{position:'top'}} }
           });
           chartBox.classList.remove('d-none');
         }
-
-        // Utilization chart (last date, if kapasite exists)
-        if(cols.includes("kapasite") && rows.some(r=>r.kapasite!==null && r.kapasite!==undefined)){
-          const lastDate = rows.reduce((m,r)=>{
-            const t=new Date(r.tarih); return (!m||t>m)?t:m;
-          }, null);
-          const lastStr=lastDate ? lastDate.toISOString().slice(0,10) : null;
-
-          const lastRows = rows.filter(r=>r.tarih.startsWith(lastStr));
-          // build labels from depo/urun if present
-          const hasDepo=cols.includes("depo");
-          const hasUrun=cols.includes("urun");
-          const items=lastRows.map(r=>{
-            const label = hasDepo && hasUrun ? `${r.depo||''} / ${r.urun||''}` :
-                           hasDepo ? `${r.depo||''}` :
-                           hasUrun ? `${r.urun||''}` : "seri";
-            const oran = (r.kullanim_orani!=null)? Number(r.kullanim_orani): null;
-            return {label, oran};
-          }).filter(x=>x.oran!=null);
-
-          // top 10
-          items.sort((a,b)=>b.oran-a.oran);
-          const top=items.slice(0,10);
-          if(top.length){
-            if(chartU) chartU.destroy();
-            chartU=new Chart(ctxUtil,{
-              type:'bar',
-              data:{ labels: top.map(x=>x.label),
-                     datasets:[{ label:`Kullanım Oranı (${lastStr})`, data: top.map(x=>x.oran) }] },
-              options:{ responsive:true, plugins:{legend:{position:'top'}}, scales:{y:{beginAtZero:true}} }
-            });
-            utilBox.classList.remove('d-none');
-          }
-        }
-
       }catch(err){
-        alertBox.textContent=(err?.message||String(err)).slice(0,600);
+        alertBox.textContent=err.message;
         alertBox.classList.remove('d-none');
       }
     });
 
+    // Tema değiştir
     document.getElementById('themeBtn').addEventListener('click',()=>{
       const html=document.documentElement;
       html.setAttribute('data-bs-theme', html.getAttribute('data-bs-theme')==='light'?'dark':'light');
