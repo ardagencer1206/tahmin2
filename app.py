@@ -1,13 +1,15 @@
 # app.py
-# Flask tabanlı Talep Tahminleme + Kapasite Planlama (SARIMA + Lineer Regresyon)
-# Girdi: .xlsx | Kapasite: database.sql + DATABASE_URL | UI: templates/index.html
+# Talep Tahminleme + Kapasite Planlama (SARIMA + Lineer Regresyon)
+# Girdi: talep.xlsx (zorunlu, name=file) + kapasite.xlsx (opsiyonel, name=capfile)
+# UI: templates/index.html  (JS tarafı /forecast dönen charts[]'ı <img src="..."> olarak gösterebilir)
 
 import os
 import io
 import warnings
+import base64
 import numpy as np
 import pandas as pd
-import json
+import matplotlib.pyplot as plt
 
 from flask import (
     Flask,
@@ -20,12 +22,19 @@ from flask import (
 
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from sqlalchemy import create_engine, text
 
 warnings.filterwarnings("ignore")
 app = Flask(__name__)
 
 _LAST_CSV_BYTES = None  # son çıktı cache
+
+# ---------- Yardımcı ----------
+def _img_to_dataurl(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
 # ---------- IO ----------
 def read_excel_file(file_storage, col_date, col_demand):
@@ -42,6 +51,25 @@ def read_excel_file(file_storage, col_date, col_demand):
     df[col_demand] = pd.to_numeric(df[col_demand], errors="coerce")
     df = df.dropna(subset=[col_date, col_demand])
     return df
+
+def read_capacity_excel(cap_storage):
+    """Esnek kolon adlarıyla kapasite xlsx oku. Beklenen: depo|warehouse|site, urun?, kapasite|capacity|..."""
+    if not cap_storage:
+        return pd.DataFrame()
+    try:
+        cap = pd.read_excel(cap_storage)
+    except Exception as e:
+        abort(400, f"Kapasite XLSX okunamadı: {e}")
+    cap.columns = [str(c).strip().lower() for c in cap.columns]
+    # kolon eşle
+    cap_depo = next((c for c in ["depo", "warehouse", "site"] if c in cap.columns), None)
+    cap_kap = next((c for c in ["kapasite", "capacity", "kapasite_birim", "kapasite_toplam"] if c in cap.columns), None)
+    cap_urun = "urun" if "urun" in cap.columns else None
+    if not cap_depo or not cap_kap:
+        abort(400, "Kapasite dosyasında gerekli kolonlar yok (depo ve kapasite).")
+    cols = [cap_depo, cap_kap] + ([cap_urun] if cap_urun else [])
+    cap = cap[cols].copy()
+    return cap.rename(columns={cap_depo: "depo", cap_kap: "kapasite", (cap_urun or "urun"): "urun"})
 
 def infer_freq_or_use(df, date_col, freq):
     if freq:
@@ -121,65 +149,27 @@ def fit_predict_lr(y, h, s):
     )
     return pd.Series(preds, index=next_index)
 
-# ---------- Kapasite ----------
-def load_capacity_from_db():
-    db_url = os.getenv("DATABASE_URL", "").strip()
-    if not db_url:
-        return pd.DataFrame()
-    sql_path = os.path.join(os.getcwd(), "database.sql")
-    if not os.path.exists(sql_path):
-        return pd.DataFrame()
-
-    with open(sql_path, "r", encoding="utf-8") as f:
-        sql_text = f.read().strip()
-    if not sql_text:
-        return pd.DataFrame()
-
-    engine = create_engine(db_url, pool_pre_ping=True)
-    with engine.connect() as conn:
-        try:
-            df = pd.read_sql_query(text(sql_text), conn)
-        except Exception:
-            last_select = None
-            for stmt in [s.strip() for s in sql_text.split(";") if s.strip()]:
-                if stmt.lower().startswith("select"):
-                    last_select = stmt
-            if last_select is None:
-                return pd.DataFrame()
-            df = pd.read_sql_query(text(last_select), conn)
-    return df
-
+# ---------- Kapasite birleşimi ----------
 def merge_capacity(forecasts_df, capacity_df, depo_col, urun_col):
     if capacity_df is None or capacity_df.empty:
         forecasts_df["kapasite"] = np.nan
         forecasts_df["kullanim_orani"] = np.nan
         return forecasts_df
-
     cap = capacity_df.copy()
-    cap.columns = [c.lower() for c in cap.columns]
-
-    cap_depo = next((c for c in ["depo", "warehouse", "site"] if c in cap.columns), None)
-    cap_kap = next((c for c in ["kapasite", "capacity", "kapasite_birim", "kapasite_toplam"] if c in cap.columns), None)
-    cap_urun = "urun" if "urun" in cap.columns else None
-
+    # eşleşme anahtarları
     keys = []
-    if depo_col in forecasts_df.columns and cap_depo:
-        keys.append((depo_col, cap_depo))
-    if urun_col and urun_col in forecasts_df.columns and cap_urun:
-        keys.append((urun_col, cap_urun))
-
-    if not keys or not cap_kap:
+    if depo_col and depo_col in forecasts_df.columns:
+        keys.append((depo_col, "depo"))
+    if urun_col and urun_col in forecasts_df.columns and "urun" in cap.columns:
+        keys.append((urun_col, "urun"))
+    if not keys:
         forecasts_df["kapasite"] = np.nan
         forecasts_df["kullanim_orani"] = np.nan
         return forecasts_df
-
     left_on = [k[0] for k in keys]
     right_on = [k[1] for k in keys]
-
-    merged = forecasts_df.merge(cap[[*right_on, cap_kap]].drop_duplicates(), how="left",
-                                left_on=left_on, right_on=right_on)
-    merged = merged.drop(columns=right_on, errors="ignore")
-    merged = merged.rename(columns={cap_kap: "kapasite"})
+    merged = forecasts_df.merge(cap.drop_duplicates(), how="left", left_on=left_on, right_on=right_on)
+    merged = merged.drop(columns=[c for c in right_on if c in merged.columns], errors="ignore")
     merged["kullanim_orani"] = merged["tahmin_mean"] / merged["kapasite"]
     return merged
 
@@ -193,7 +183,7 @@ def forecast_group(df_group, h, s, date_col, demand_col, freq_hint):
     out["tahmin_mean"] = out[["sarima", "linreg"]].mean(axis=1)
     return out
 
-def run_pipeline(xlsx_file, h, s, col_date, col_demand, col_depo, col_urun, freq):
+def run_pipeline(xlsx_file, capfile, h, s, col_date, col_demand, col_depo, col_urun, freq):
     df = read_excel_file(xlsx_file, col_date, col_demand)
     freq_hint = infer_freq_or_use(df, col_date, freq)
 
@@ -205,7 +195,8 @@ def run_pipeline(xlsx_file, h, s, col_date, col_demand, col_depo, col_urun, freq
         group_cols = ["_grp"]
         grouped = df.groupby(group_cols)
 
-    cap_df = load_capacity_from_db()
+    # kapasite dosyası
+    cap_df = read_capacity_excel(capfile) if capfile else pd.DataFrame()
 
     outs = []
     for keys, g in grouped:
@@ -218,17 +209,60 @@ def run_pipeline(xlsx_file, h, s, col_date, col_demand, col_depo, col_urun, freq
         outs.append(fc)
 
     res = pd.concat(outs, ignore_index=True)
+
     depo_col = col_depo if col_depo in res.columns else None
     urun_col = col_urun if col_urun in res.columns else None
     res2 = merge_capacity(res, cap_df, depo_col, urun_col)
 
+    # sütun sırası
     lead = []
     if "tarih" in res2.columns: lead.append("tarih")
     if depo_col: lead.append(depo_col)
     if urun_col: lead.append(urun_col)
     ordered = lead + [c for c in ["sarima", "linreg", "tahmin_mean", "kapasite", "kullanim_orani"] if c in res2.columns]
     other = [c for c in res2.columns if c not in ordered]
-    return res2[ordered + other]
+    res2 = res2[ordered + other]
+    return res2, cap_df
+
+# ---------- Grafikler ----------
+def build_charts(result_df, cap_df, depo_col, urun_col):
+    charts = []
+
+    # 1) Toplam tahmin eğrisi (tahmin_mean sum)
+    if "tarih" in result_df.columns and "tahmin_mean" in result_df.columns:
+        agg = result_df.groupby("tarih", as_index=True)["tahmin_mean"].sum()
+        fig = plt.figure()
+        ax = fig.gca()
+        agg.plot(ax=ax)
+        ax.set_title("Toplam Tahmin")
+        ax.set_xlabel("Tarih")
+        ax.set_ylabel("Miktar")
+        charts.append({"title": "Toplam Tahmin", "image": _img_to_dataurl(fig)})
+
+    # 2) Son dönem kullanım oranı (varsa kapasite)
+    if "kapasite" in result_df.columns and result_df["kapasite"].notna().any():
+        last_date = result_df["tarih"].max()
+        last_df = result_df[result_df["tarih"] == last_date].copy()
+
+        key_cols = [c for c in [depo_col, urun_col] if c and c in last_df.columns]
+        if not key_cols:
+            key_cols = []  # tek seri
+            last_df["anahtar"] = "seri"
+            key_cols = ["anahtar"]
+
+        last_df["oran"] = last_df["tahmin_mean"] / last_df["kapasite"]
+        top = last_df.sort_values("oran", ascending=False).head(10)
+
+        labels = top[key_cols].astype(str).agg(" / ".join, axis=1) if len(key_cols) > 1 else top[key_cols[0]]
+        fig2 = plt.figure()
+        ax2 = fig2.gca()
+        ax2.bar(labels, top["oran"])
+        ax2.set_title(f"Son Dönem Kullanım Oranı ({str(last_date)})")
+        ax2.set_ylabel("Oran")
+        ax2.set_xticklabels(labels, rotation=45, ha="right")
+        charts.append({"title": "Kullanım Oranı (Son Dönem)", "image": _img_to_dataurl(fig2)})
+
+    return charts
 
 # ---------- Rotalar ----------
 @app.route("/", methods=["GET"])
@@ -240,10 +274,12 @@ def forecast_endpoint():
     global _LAST_CSV_BYTES
 
     if "file" not in request.files:
-        abort(400, "Dosya yüklenmedi.")
+        abort(400, "Talep dosyası yüklenmedi.")
     file = request.files["file"]
+    capfile = request.files.get("capfile")  # opsiyonel
+
     if not file or file.filename == "":
-        abort(400, "Geçersiz dosya.")
+        abort(400, "Geçersiz talep dosyası.")
 
     h = int(request.form.get("h", "12"))
     s = int(request.form.get("s", "12"))
@@ -253,31 +289,33 @@ def forecast_endpoint():
     col_urun = (request.form.get("col_urun", "urun") or "").strip() or None
     freq = (request.form.get("freq", "") or "").strip() or None
 
-    res_df = run_pipeline(file, h, s, col_date, col_demand, col_depo, col_urun, freq)
+    res_df, cap_df = run_pipeline(file, capfile, h, s, col_date, col_demand, col_depo, col_urun, freq)
 
     # CSV cache
     csv_buf = io.StringIO()
     res_df.to_csv(csv_buf, index=False)
     _LAST_CSV_BYTES = csv_buf.getvalue().encode("utf-8")
 
-    # JSON-safe: NaN/±inf -> null (via pandas to_json)
+    # Charts
+    charts = build_charts(res_df.copy(), cap_df, col_depo, col_urun)
+
+    # JSON-safe
     out_df = res_df.copy()
     if "tarih" in out_df.columns:
         out_df["tarih"] = out_df["tarih"].astype(str)
     out_df = out_df.replace([np.inf, -np.inf], np.nan)
-
-    data = json.loads(out_df.to_json(orient="records"))  # tüm NaN -> null
+    data = pd.read_json(out_df.to_json(orient="records"))
 
     resp = {
         "h": h,
         "s": s,
         "n_kayit": int(len(out_df)),
         "columns": list(out_df.columns),
-        "data": data,
-        "capacity_source": "database.sql + DATABASE_URL" if os.getenv("DATABASE_URL") else "none",
+        "data": data.to_dict(orient="records"),
+        "capacity_source": "xlsx" if (capfile and getattr(capfile, "filename", "")) else "none",
+        "charts": charts,  # [{title, image(data URL)}]
     }
     return jsonify(resp)
-
 
 @app.route("/download_last.csv", methods=["GET"])
 def download_last():
