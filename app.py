@@ -49,6 +49,11 @@ def read_excel_file(file_storage, col_date, col_demand):
     except Exception as e:
         abort(400, f"XLSX okunamadı: {e}")
 
+    # kolon isimlerini normalize et
+    df.columns = df.columns.str.strip().str.lower()
+    col_date = col_date.lower()
+    col_demand = col_demand.lower()
+
     for c in [col_date, col_demand]:
         if c not in df.columns:
             abort(400, f"Gerekli sütun yok: {c}")
@@ -59,7 +64,6 @@ def read_excel_file(file_storage, col_date, col_demand):
     return df
 
 def read_capacity_excel(cap_storage):
-    """Beklenen kolonlar: depo|warehouse|site, kapasite|capacity|..., opsiyonel urun"""
     if not cap_storage:
         return pd.DataFrame()
     try:
@@ -67,16 +71,20 @@ def read_capacity_excel(cap_storage):
     except Exception as e:
         abort(400, f"Kapasite XLSX okunamadı: {e}")
 
-    cap.columns = [str(c).strip().lower() for c in cap.columns]
+    cap.columns = cap.columns.str.strip().str.lower()
     cap_depo = next((c for c in ["depo", "warehouse", "site"] if c in cap.columns), None)
     cap_kap = next((c for c in ["kapasite", "capacity", "kapasite_birim", "kapasite_toplam"] if c in cap.columns), None)
     cap_urun = "urun" if "urun" in cap.columns else None
+
     if not cap_depo or not cap_kap:
         abort(400, "Kapasite dosyasında gerekli kolonlar yok (depo ve kapasite).")
 
     cols = [cap_depo, cap_kap] + ([cap_urun] if cap_urun else [])
     cap = cap[cols].copy()
-    return cap.rename(columns={cap_depo: "depo", cap_kap: "kapasite", (cap_urun or "urun"): "urun"})
+    rename_map = {cap_depo: "depo", cap_kap: "kapasite"}
+    if cap_urun:
+        rename_map[cap_urun] = "urun"
+    return cap.rename(columns=rename_map)
 
 def infer_freq_or_use(df, date_col, freq):
     if freq:
@@ -290,10 +298,10 @@ def forecast_endpoint():
 
     h = int(request.form.get("h", "12"))
     s = int(request.form.get("s", "12"))
-    col_date = request.form.get("col_date", "tarih").strip()
-    col_demand = request.form.get("col_demand", "talep").strip()
-    col_depo = (request.form.get("col_depo", "depo") or "").strip() or None
-    col_urun = (request.form.get("col_urun", "urun") or "").strip() or None
+    col_date = request.form.get("col_date", "tarih").strip().lower()
+    col_demand = request.form.get("col_demand", "talep").strip().lower()
+    col_depo = (request.form.get("col_depo", "depo") or "").strip().lower() or None
+    col_urun = (request.form.get("col_urun", "urun") or "").strip().lower() or None
     freq = (request.form.get("freq", "") or "").strip() or None
 
     res_df, cap_df = run_pipeline(file, capfile, h, s, col_date, col_demand, col_depo, col_urun, freq)
