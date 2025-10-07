@@ -1,31 +1,35 @@
 # app.py
-# Talep Tahminleme + Kapasite Planlama (Lineer Regresyon + Chart.js için JSON)
+# Talep Tahminleme + Kapasite Planlama
+# Modeller: Lineer Regresyon (LR) + Ağırlıklı Hareketli Ortalama (WMA)
 # Girdi: talep.xlsx (name=file, zorunlu) + kapasite.xlsx (name=capfile, opsiyonel)
+# UI: templates/index.html (Chart.js frontend)
 
 import os
 import io
 import json
 import warnings
-
 import numpy as np
 import pandas as pd
-
-from flask import (
-    Flask, request, jsonify, send_file, render_template, abort
-)
+from flask import Flask, request, jsonify, send_file, render_template, abort
 from sklearn.linear_model import LinearRegression
 
 warnings.filterwarnings("ignore")
+
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB dosya limiti
 
 _LAST_CSV_BYTES = None  # son CSV cache
 
-# ---------- IO ----------
+# ----------------- IO -----------------
 def read_excel_file(file_storage, col_date, col_demand):
     try:
         df = pd.read_excel(file_storage)
     except Exception as e:
         abort(400, f"XLSX okunamadı: {e}")
+
+    df.columns = df.columns.str.strip().str.lower()
+    col_date = col_date.lower()
+    col_demand = col_demand.lower()
 
     for c in [col_date, col_demand]:
         if c not in df.columns:
@@ -45,7 +49,7 @@ def read_capacity_excel(cap_storage):
     except Exception as e:
         abort(400, f"Kapasite XLSX okunamadı: {e}")
 
-    cap.columns = [str(c).strip().lower() for c in cap.columns]
+    cap.columns = cap.columns.str.strip().str.lower()
     cap_depo = next((c for c in ["depo", "warehouse", "site"] if c in cap.columns), None)
     cap_kap = next((c for c in ["kapasite", "capacity"] if c in cap.columns), None)
     cap_urun = "urun" if "urun" in cap.columns else None
@@ -54,109 +58,157 @@ def read_capacity_excel(cap_storage):
 
     cols = [cap_depo, cap_kap] + ([cap_urun] if cap_urun else [])
     cap = cap[cols].copy()
-    return cap.rename(columns={cap_depo: "depo", cap_kap: "kapasite", (cap_urun or "urun"): "urun"})
+    rename = {cap_depo: "depo", cap_kap: "kapasite"}
+    if cap_urun: rename[cap_urun] = "urun"
+    return cap.rename(columns=rename)
 
+# ----------------- Zaman Serisi Yardımcıları -----------------
+def infer_freq(dates: pd.Series, fallback="M"):
+    try:
+        f = pd.infer_freq(dates.sort_values())
+        return f or fallback
+    except Exception:
+        return fallback
 
-# ---------- Basit Model ----------
-def fit_predict_lr(y, h, s):
+def next_index(last_date: pd.Timestamp, periods: int, base_dates: pd.Series):
+    freq = infer_freq(base_dates)
+    step = pd.tseries.frequencies.to_offset(freq)
+    start = last_date + step
+    return pd.date_range(start, periods=periods, freq=freq)
+
+# ----------------- Modeller -----------------
+def fit_predict_lr(y: np.ndarray, h: int):
     n = len(y)
     X = np.arange(n).reshape(-1, 1)
-    model = LinearRegression()
-    model.fit(X, y)
+    m = LinearRegression().fit(X, y.astype(float))
+    # Çok adımlı ileri tahmin
+    X_fut = np.arange(n, n + h).reshape(-1, 1)
+    return m.predict(X_fut).tolist()
+
+def predict_wma(y: np.ndarray, h: int, window: int = 3, weights: np.ndarray | None = None):
+    if window < 1:
+        window = 3
+    y_list = list(y.astype(float))
+    if weights is None:
+        # lineer ağırlıklar: 1..window
+        weights = np.arange(1, window + 1, dtype=float)
+    else:
+        weights = np.array(weights, dtype=float)
+        if len(weights) != window:
+            window = len(weights)
+    w = weights / weights.sum()
 
     preds = []
-    for k in range(1, h + 1):
-        x_next = np.array([[n + k - 1]])
-        y_hat = model.predict(x_next)[0]
-        preds.append(y_hat)
-
+    for _ in range(h):
+        src = y_list[-window:] if len(y_list) >= window else ( [y_list[-1]] * (window - len(y_list)) + y_list )
+        val = float(np.dot(src[-window:], w))
+        preds.append(val)
+        y_list.append(val)
     return preds
 
-
-# ---------- Pipeline ----------
-def run_pipeline(xlsx_file, capfile, h, col_date, col_demand, col_depo, col_urun):
+# ----------------- Pipeline -----------------
+def run_pipeline(xlsx_file, capfile, h, col_date, col_demand, col_depo, col_urun, wma_window):
     df = read_excel_file(xlsx_file, col_date, col_demand)
-
+    # grup kolonlarını normalize et
     group_cols = [c for c in [col_depo, col_urun] if c and c in df.columns]
-    if group_cols:
-        grouped = df.groupby(group_cols, dropna=False)
-    else:
-        df["_grp"] = "serie"
-        group_cols = ["_grp"]
-        grouped = df.groupby(group_cols)
+    grouped = df.groupby(group_cols, dropna=False) if group_cols else [(("serie",), df.assign(_grp="serie"))]
 
     cap_df = read_capacity_excel(capfile) if capfile else pd.DataFrame()
 
     outs = []
-    for keys, g in grouped:
+    for keys, g in grouped if isinstance(grouped, list) else grouped:
+        # tarih sırası
         g = g.sort_values(col_date)
-        ts = g[col_demand].values.astype(float)
-        preds = fit_predict_lr(ts, h, s=12)
+        y = g[col_demand].to_numpy(dtype=float)
+        if len(y) < 2:
+            continue
 
-        dates = pd.date_range(g[col_date].iloc[-1] + pd.Timedelta(days=1), periods=h, freq="M")
-        out = pd.DataFrame({"tarih": dates, "linreg": preds})
+        # Tahminler
+        lr = fit_predict_lr(y, h)
+        wma = predict_wma(y, h, window=wma_window)
+        # tarihleri oluştur
+        fut_idx = next_index(g[col_date].iloc[-1], h, g[col_date])
 
-        if isinstance(keys, tuple):
-            for name, val in zip(group_cols, keys):
-                out[name] = val
+        out = pd.DataFrame({
+            "tarih": fut_idx,
+            "linreg": lr,
+            "wma": wma,
+        })
+        out["tahmin_mean"] = out[["linreg", "wma"]].mean(axis=1)
+
+        # grup anahtarlarını yaz
+        if group_cols:
+            if isinstance(keys, tuple):
+                for name, val in zip(group_cols, keys):
+                    out[name] = val
+            else:
+                out[group_cols[0]] = keys
         else:
-            out[group_cols[0]] = keys
+            out["_grp"] = "serie"
 
         outs.append(out)
+
+    if not outs:
+        abort(400, "Yeterli veri yok.")
 
     res = pd.concat(outs, ignore_index=True)
 
     # kapasite merge
     if not cap_df.empty:
         keys = []
-        if col_depo and col_depo in res.columns:
-            keys.append((col_depo, "depo"))
-        if col_urun and col_urun in res.columns and "urun" in cap_df.columns:
-            keys.append((col_urun, "urun"))
-
+        if col_depo and col_depo in res.columns: keys.append((col_depo, "depo"))
+        if col_urun and col_urun in res.columns and "urun" in cap_df.columns: keys.append((col_urun, "urun"))
         if keys:
-            left_on = [k[0] for k in keys]
-            right_on = [k[1] for k in keys]
+            left_on = [k[0] for k in keys]; right_on = [k[1] for k in keys]
             res = res.merge(cap_df, how="left", left_on=left_on, right_on=right_on)
-            res["kullanim_orani"] = res["linreg"] / res["kapasite"]
+            res["kullanim_orani"] = res["tahmin_mean"] / res["kapasite"]
+
+    # sütun sırası
+    lead = [c for c in ["tarih", col_depo, col_urun] if c and c in res.columns] or ["tarih"]
+    ordered = lead + [c for c in ["linreg", "wma", "tahmin_mean", "kapasite", "kullanim_orani"] if c in res.columns]
+    other = [c for c in res.columns if c not in ordered]
+    res = res[ordered + other]
 
     return res, cap_df
 
-
-# ---------- Routes ----------
+# ----------------- Routes -----------------
 @app.route("/")
 def index():
     return render_template("index.html")
 
-
 @app.route("/forecast", methods=["POST"])
 def forecast_endpoint():
     global _LAST_CSV_BYTES
+
     if "file" not in request.files:
         abort(400, "Talep dosyası yüklenmedi.")
     file = request.files["file"]
-    capfile = request.files.get("capfile")
+    capfile = request.files.get("capfile")  # opsiyonel
 
     h = int(request.form.get("h", "12"))
-    col_date = request.form.get("col_date", "tarih").strip()
-    col_demand = request.form.get("col_demand", "talep").strip()
-    col_depo = (request.form.get("col_depo", "depo") or "").strip() or None
-    col_urun = (request.form.get("col_urun", "urun") or "").strip() or None
+    col_date = (request.form.get("col_date", "tarih") or "tarih").strip().lower()
+    col_demand = (request.form.get("col_demand", "talep") or "talep").strip().lower()
+    col_depo = (request.form.get("col_depo", "depo") or "").strip().lower() or None
+    col_urun = (request.form.get("col_urun", "urun") or "").strip().lower() or None
+    wma_window = int(request.form.get("wma_window", "3"))
 
-    res_df, cap_df = run_pipeline(file, capfile, h, col_date, col_demand, col_depo, col_urun)
+    res_df, cap_df = run_pipeline(file, capfile, h, col_date, col_demand, col_depo, col_urun, wma_window)
 
     # CSV cache
     csv_buf = io.StringIO()
     res_df.to_csv(csv_buf, index=False)
     _LAST_CSV_BYTES = csv_buf.getvalue().encode("utf-8")
 
+    # JSON-safe
     out_df = res_df.copy()
-    out_df["tarih"] = out_df["tarih"].astype(str)
+    if "tarih" in out_df.columns:
+        out_df["tarih"] = out_df["tarih"].astype(str)
     out_df = out_df.replace([np.inf, -np.inf], np.nan)
     data = json.loads(out_df.to_json(orient="records"))
 
     resp = {
         "h": h,
+        "wma_window": wma_window,
         "n_kayit": len(out_df),
         "columns": list(out_df.columns),
         "data": data,
@@ -164,19 +216,17 @@ def forecast_endpoint():
     }
     return jsonify(resp)
 
-
 @app.route("/download_last.csv")
 def download_last():
     global _LAST_CSV_BYTES
     if not _LAST_CSV_BYTES:
-        abort(404, "Önce /forecast çağrısı çalıştırılmalı.")
+        abort(404, "Önce /forecast çalıştırılmalı.")
     return send_file(
         io.BytesIO(_LAST_CSV_BYTES),
         mimetype="text/csv",
         as_attachment=True,
         download_name="forecast_capacity.csv",
     )
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
