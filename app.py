@@ -4,10 +4,7 @@
 
 import os
 import io
-import json
 import warnings
-from datetime import timedelta
-
 import numpy as np
 import pandas as pd
 
@@ -17,12 +14,11 @@ from flask import (
     jsonify,
     send_file,
     render_template,
-    abort
+    abort,
 )
 
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-
 from sqlalchemy import create_engine, text
 
 warnings.filterwarnings("ignore")
@@ -31,7 +27,7 @@ app = Flask(__name__)
 _LAST_CSV_BYTES = None  # son çıktı cache
 
 # ---------- IO ----------
-def read_excel_file(file_storage, col_date, col_demand, freq=None):
+def read_excel_file(file_storage, col_date, col_demand):
     try:
         df = pd.read_excel(file_storage)
     except Exception as e:
@@ -47,7 +43,7 @@ def read_excel_file(file_storage, col_date, col_demand, freq=None):
     return df
 
 def infer_freq_or_use(df, date_col, freq):
-    if freq and isinstance(freq, str) and freq.strip():
+    if freq:
         return freq.strip()
     try:
         return pd.infer_freq(df.sort_values(date_col)[date_col])
@@ -74,24 +70,21 @@ def ensure_continuous_index(s, freq_hint):
 
 # ---------- Modeller ----------
 def fit_predict_sarima(y, h, s):
-    try:
-        model = SARIMAX(
-            y,
-            order=(1, 1, 1),
-            seasonal_order=(1, 1, 1, int(s)),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        )
-        res = model.fit(disp=False)
-        fc = res.get_forecast(steps=h).predicted_mean
-        fc.index = pd.date_range(
-            y.index[-1] + (y.index[-1] - y.index[-2] if len(y) > 1 else pd.Timedelta(days=1)),
-            periods=h,
-            freq=y.index.freq or y.index.inferred_freq,
-        )
-        return fc
-    except Exception as e:
-        raise RuntimeError(f"SARIMA başarısız: {e}")
+    model = SARIMAX(
+        y,
+        order=(1, 1, 1),
+        seasonal_order=(1, 1, 1, int(s)),
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    res = model.fit(disp=False)
+    fc = res.get_forecast(steps=h).predicted_mean
+    fc.index = pd.date_range(
+        y.index[-1] + (y.index[-1] - y.index[-2] if len(y) > 1 else pd.Timedelta(days=1)),
+        periods=h,
+        freq=y.index.freq or y.index.inferred_freq,
+    )
+    return fc
 
 def build_lr_features(y, s):
     n = len(y)
@@ -156,7 +149,7 @@ def load_capacity_from_db():
     return df
 
 def merge_capacity(forecasts_df, capacity_df, depo_col, urun_col):
-    if capacity_df is None or capacity_df.empty:
+    if capacity_df.empty:
         forecasts_df["kapasite"] = np.nan
         forecasts_df["kullanim_orani"] = np.nan
         return forecasts_df
@@ -192,7 +185,7 @@ def merge_capacity(forecasts_df, capacity_df, depo_col, urun_col):
 # ---------- İş akışı ----------
 def forecast_group(df_group, h, s, date_col, demand_col, freq_hint):
     ts = df_group.set_index(date_col)[demand_col].sort_index()
-    ts, freq_used = ensure_continuous_index(ts, freq_hint)
+    ts, _ = ensure_continuous_index(ts, freq_hint)
     sar = fit_predict_sarima(ts, h, s)
     lr = fit_predict_lr(ts, h, s)
     out = pd.DataFrame({"tarih": sar.index, "sarima": sar.values, "linreg": lr.values})
@@ -200,7 +193,7 @@ def forecast_group(df_group, h, s, date_col, demand_col, freq_hint):
     return out
 
 def run_pipeline(xlsx_file, h, s, col_date, col_demand, col_depo, col_urun, freq):
-    df = read_excel_file(xlsx_file, col_date, col_demand, freq=freq)
+    df = read_excel_file(xlsx_file, col_date, col_demand)
     freq_hint = infer_freq_or_use(df, col_date, freq)
 
     group_cols = [c for c in [col_depo, col_urun] if c and c in df.columns]
@@ -224,15 +217,14 @@ def run_pipeline(xlsx_file, h, s, col_date, col_demand, col_depo, col_urun, freq
         outs.append(fc)
 
     res = pd.concat(outs, ignore_index=True)
-
     depo_col = col_depo if col_depo in res.columns else None
     urun_col = col_urun if col_urun in res.columns else None
     res2 = merge_capacity(res, cap_df, depo_col, urun_col)
 
     lead = []
     if "tarih" in res2.columns: lead.append("tarih")
-    if depo_col and depo_col in res2.columns: lead.append(depo_col)
-    if urun_col and urun_col in res2.columns: lead.append(urun_col)
+    if depo_col: lead.append(depo_col)
+    if urun_col: lead.append(urun_col)
     ordered = lead + [c for c in ["sarima", "linreg", "tahmin_mean", "kapasite", "kullanim_orani"] if c in res2.columns]
     other = [c for c in res2.columns if c not in ordered]
     return res2[ordered + other]
@@ -269,6 +261,7 @@ def forecast_endpoint():
     out_df = res_df.copy()
     if "tarih" in out_df.columns:
         out_df["tarih"] = out_df["tarih"].astype(str)
+    out_df = out_df.where(pd.notnull(out_df), None)  # NaN → null
 
     resp = {
         "h": h,
