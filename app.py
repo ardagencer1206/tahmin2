@@ -4,7 +4,6 @@
 
 import os
 import io
-import json
 import warnings
 import numpy as np
 import pandas as pd
@@ -17,7 +16,6 @@ from flask import (
     render_template,
     abort,
 )
-from flask.json.provider import DefaultJSONProvider
 
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -25,17 +23,6 @@ from sqlalchemy import create_engine, text
 
 warnings.filterwarnings("ignore")
 app = Flask(__name__)
-
-# --- JSON: NaN/inf temizleyici ---
-class CleanJSONProvider(DefaultJSONProvider):
-    def dumps(self, obj, **kwargs):
-        # NaN/Infinity JSON standardında yok; ignore_nan=True → null
-        kwargs.setdefault("ignore_nan", True)
-        return json.dumps(obj, **kwargs)
-    def loads(self, s, **kwargs):
-        return json.loads(s, **kwargs)
-
-app.json = CleanJSONProvider(app)
 
 _LAST_CSV_BYTES = None  # son çıktı cache
 
