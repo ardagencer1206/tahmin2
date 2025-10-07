@@ -7,3 +7,4 @@ statsmodels==0.14.2
 SQLAlchemy==2.0.32
 psycopg2-binary==2.9.9
 openpyxl==3.1.5
+matplotlib
