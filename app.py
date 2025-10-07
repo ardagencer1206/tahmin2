@@ -260,21 +260,24 @@ def forecast_endpoint():
     res_df.to_csv(csv_buf, index=False)
     _LAST_CSV_BYTES = csv_buf.getvalue().encode("utf-8")
 
-    # JSON güvenli dönüş: NaN/inf → null
+    # JSON-safe: NaN/±inf -> null (via pandas to_json)
     out_df = res_df.copy()
     if "tarih" in out_df.columns:
         out_df["tarih"] = out_df["tarih"].astype(str)
-    out_df = out_df.replace([np.inf, -np.inf], np.nan).where(pd.notnull(out_df), None)
+    out_df = out_df.replace([np.inf, -np.inf], np.nan)
+
+    data = json.loads(out_df.to_json(orient="records"))  # tüm NaN -> null
 
     resp = {
         "h": h,
         "s": s,
         "n_kayit": int(len(out_df)),
         "columns": list(out_df.columns),
-        "data": out_df.to_dict(orient="records"),
+        "data": data,
         "capacity_source": "database.sql + DATABASE_URL" if os.getenv("DATABASE_URL") else "none",
     }
     return jsonify(resp)
+
 
 @app.route("/download_last.csv", methods=["GET"])
 def download_last():
