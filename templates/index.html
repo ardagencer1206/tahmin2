@@ -3,19 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Talep Tahminleme + Kapasite Planlama</title>
+  <title>Ürün Bazlı Tahmin · Eti Maden</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     body{background:var(--bs-body-bg)}
     .nowrap{white-space:nowrap}
     .table-responsive{max-height:60vh}
+    .chip{cursor:pointer}
   </style>
 </head>
 <body>
   <nav class="navbar navbar-expand-lg bg-body-tertiary sticky-top shadow-sm">
     <div class="container-fluid">
-      <span class="navbar-brand fw-semibold">Eti Maden · Tahmin & Kapasite</span>
+      <span class="navbar-brand fw-semibold">Eti Maden · Ürün Bazlı Tahmin</span>
       <div class="d-flex gap-2 ms-auto">
         <a class="btn btn-outline-primary btn-sm" href="/download_last.csv" target="_blank" rel="noopener">CSV indir</a>
         <button class="btn btn-outline-secondary btn-sm" id="themeBtn" type="button">Tema</button>
@@ -29,20 +30,18 @@
       <div class="col-12 col-lg-4">
         <div class="card shadow-sm">
           <div class="card-body">
-            <h5 class="mb-3">Veri Yükle</h5>
+            <h6 class="mb-3">Veri Yükle</h6>
             <form id="form" novalidate>
               <div class="mb-3">
-                <label class="form-label">Talep dosyası (.xlsx) <span class="text-danger">*</span></label>
+                <label class="form-label">Talep (.xlsx) <span class="text-danger">*</span></label>
                 <input class="form-control" type="file" name="file" accept=".xlsx" required>
-                <div class="form-text">Zorunlu kolonlar: <code>tarih</code>, <code>talep</code>. Opsiyonel: <code>depo</code>, <code>urun</code></div>
+                <div class="form-text">Kolonlar: <code>tarih</code>, <code>talep</code>, <code>urun</code> (zorunlu), opsiyonel <code>depo</code></div>
               </div>
-
               <div class="mb-3">
-                <label class="form-label">Kapasite dosyası (.xlsx) <span class="text-body-secondary">(opsiyonel)</span></label>
+                <label class="form-label">Kapasite (.xlsx) <span class="text-body-secondary">(opsiyonel)</span></label>
                 <input class="form-control" type="file" name="capfile" accept=".xlsx">
-                <div class="form-text">Kolonlar: <code>depo</code>, <code>kapasite</code> ve opsiyonel <code>urun</code></div>
+                <div class="form-text">Kolonlar: <code>urun</code>, <code>kapasite</code> (veya depo+urun+kapasite)</div>
               </div>
-
               <div class="row g-2">
                 <div class="col-6">
                   <label class="form-label">Tahmin ufku (h)</label>
@@ -53,7 +52,6 @@
                   <input class="form-control" type="number" name="wma_window" value="3" min="1">
                 </div>
               </div>
-
               <div class="row g-2 mt-2">
                 <div class="col-6">
                   <label class="form-label">Tarih sütunu</label>
@@ -64,7 +62,6 @@
                   <input class="form-control" type="text" name="col_demand" value="talep">
                 </div>
               </div>
-
               <div class="row g-2 mt-2">
                 <div class="col-6">
                   <label class="form-label">Depo sütunu</label>
@@ -75,7 +72,6 @@
                   <input class="form-control" type="text" name="col_urun" value="urun">
                 </div>
               </div>
-
               <div class="d-grid mt-3">
                 <button class="btn btn-primary" type="submit">Çalıştır</button>
               </div>
@@ -90,21 +86,30 @@
         <div class="card shadow-sm">
           <div class="card-body">
             <div class="d-flex align-items-center gap-2 flex-wrap mb-3">
-              <h5 class="mb-0">Sonuç</h5>
+              <h6 class="mb-0">Sonuç</h6>
               <span id="capBadge" class="badge text-bg-secondary d-none">Kapasite: none</span>
               <span id="countBadge" class="badge text-bg-info d-none">Kayıt: 0</span>
               <span id="metaBadge" class="badge text-bg-light border d-none"></span>
             </div>
 
-            <!-- Çizgisel toplam tahmin -->
+            <!-- Ürün filtreleri -->
+            <div id="urunChips" class="mb-3 d-none"></div>
+
+            <!-- Ürün bazlı çizgi grafik -->
             <div class="mb-4 d-none" id="lineBox">
-              <h6 class="mb-2">Zamana Göre Toplam Tahmin</h6>
+              <div class="d-flex justify-content-between align-items-center">
+                <h6 class="mb-2">Ürün Bazlı Tahmin (LinReg, WMA, Ortalama)</h6>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="stackSwitch">
+                  <label class="form-check-label small" for="stackSwitch">Ürünleri ayrı dataset</label>
+                </div>
+              </div>
               <canvas id="lineChart"></canvas>
             </div>
 
-            <!-- Son dönem kullanım oranı -->
+            <!-- Son dönem ürün kullanım oranı -->
             <div class="mb-4 d-none" id="barBox">
-              <h6 class="mb-2">Son Dönem Kullanım Oranı (ilk 10)</h6>
+              <h6 class="mb-2">Son Dönem Kullanım Oranı · Ürün</h6>
               <canvas id="barChart"></canvas>
             </div>
 
@@ -143,11 +148,13 @@
     const capBadge=document.getElementById('capBadge');
     const countBadge=document.getElementById('countBadge');
     const metaBadge=document.getElementById('metaBadge');
+    const chips=document.getElementById('urunChips');
 
     const lineBox=document.getElementById('lineBox');
     const barBox=document.getElementById('barBox');
     const lineCtx=document.getElementById('lineChart');
     const barCtx=document.getElementById('barChart');
+    const stackSwitch=document.getElementById('stackSwitch');
 
     const tableWrap=document.getElementById('tableWrap');
     const thead=document.getElementById('thead');
@@ -159,107 +166,112 @@
 
     // Tablo durum
     let rows=[], columns=[], page=1, pageSize=25;
+    let selectedUruns=new Set(); // boşsa tüm ürünler
 
     function renderTable(){
       const start=(page-1)*pageSize, end=start+pageSize;
-      const slice=rows.slice(start,end);
+      const filtered = rows.filter(r => !selectedUruns.size || selectedUruns.has(String(r.urun)));
+      const slice=filtered.slice(start,end);
       tbody.innerHTML = slice.map(r=>`<tr>${
         columns.map(c=>`<td>${r[c]??''}</td>`).join('')
       }</tr>`).join('');
-      const max=Math.max(1,Math.ceil(rows.length/pageSize));
+      const max=Math.max(1,Math.ceil(filtered.length/pageSize));
       pageInfo.textContent=`Sayfa ${page} / ${max}`;
       prevBtn.disabled=page===1;
       nextBtn.disabled=page>=max;
     }
     prevBtn.addEventListener('click',()=>{ if(page>1){page--;renderTable()} });
-    nextBtn.addEventListener('click',()=>{ const max=Math.ceil(rows.length/pageSize); if(page<max){page++;renderTable()} });
+    nextBtn.addEventListener('click',()=>{ const filtered = rows.filter(r => !selectedUruns.size || selectedUruns.has(String(r.urun))); const max=Math.ceil(filtered.length/pageSize); if(page<max){page++;renderTable()} });
 
     // Chart.js instance'ları
     let lineChart=null, barChart=null;
 
-    function toDateObj(s){
-      const d=new Date(s);
-      return isNaN(d)?null:d;
+    function uniqueUruns(data){
+      return [...new Set((data||[]).map(r=>String(r.urun)))].filter(Boolean);
     }
 
-    function buildLineChart(data){
-      // tarih -> sum(linreg/wma/tahmin_mean)
-      const acc=new Map();
-      for(const r of data){
-        if(!r.tarih) continue;
-        const key=r.tarih;
-        const cur=acc.get(key)||{lin:0,wma:0,mean:0};
-        cur.lin += Number(r.linreg ?? 0);
-        cur.wma += Number(r.wma ?? 0);
-        cur.mean+= Number(r.tahmin_mean ?? ((r.linreg??0 + r.wma??0)/2));
-        acc.set(key,cur);
-      }
-      const labels=[...acc.keys()].sort((a,b)=>new Date(a)-new Date(b));
-      const lin=labels.map(k=>acc.get(k).lin);
-      const wma=labels.map(k=>acc.get(k).wma);
-      const mean=labels.map(k=>acc.get(k).mean);
+    function buildChips(uruns){
+      chips.innerHTML='';
+      uruns.forEach(u=>{
+        const span=document.createElement('span');
+        span.className='badge text-bg-light border me-2 chip';
+        span.textContent=u;
+        span.onclick=()=>{
+          if(selectedUruns.has(u)) selectedUruns.delete(u); else selectedUruns.add(u);
+          span.className = 'badge me-2 chip ' + (selectedUruns.has(u)?'text-bg-primary':'text-bg-light border');
+          // güncelle grafik ve tablo
+          drawCharts(rows); page=1; renderTable();
+        };
+        chips.appendChild(span);
+      });
+      chips.classList.remove('d-none');
+    }
 
-      if(lineChart){ lineChart.destroy(); }
+    function drawLinePerProduct(data){
+      const filtered = data.filter(r => !selectedUruns.size || selectedUruns.has(String(r.urun)));
+      const byKey = {}; // {urun: {labels:[], lin:[], wma:[], mean:[]}}
+      for(const r of filtered){
+        const u=String(r.urun); const t=r.tarih;
+        if(!byKey[u]) byKey[u]={labels:[], lin:[], wma:[], mean:[]};
+        byKey[u].labels.push(t);
+        byKey[u].lin.push(Number(r.linreg ?? 0));
+        byKey[u].wma.push(Number(r.wma ?? 0));
+        byKey[u].mean.push(Number(r.tahmin_mean ?? ((r.linreg??0 + r.wma??0)/2)));
+      }
+      const labels=[...new Set(Object.values(byKey).flatMap(v=>v.labels))].sort((a,b)=>new Date(a)-new Date(b));
+
+      const datasets=[];
+      const colors=["#0d6efd","#6610f2","#20c997","#fd7e14","#dc3545","#6f42c1","#198754","#0dcaf0","#adb5bd","#ffc107"];
+      let ci=0;
+      Object.entries(byKey).forEach(([u,v])=>{
+        const mapToLabels=(arrLabels, arrVals)=>{
+          const map=new Map(v.labels.map((L,i)=>[L,arrVals[i]]));
+          return labels.map(L=>map.get(L)??null);
+        };
+        datasets.push({label:`${u} · Ortalama`, data:mapToLabels(v.labels,v.mean), tension:0.25, borderWidth:2, borderColor:colors[(ci++)%colors.length]});
+        if(!stackSwitch.checked){
+          datasets.push({label:`${u} · LinReg`, data:mapToLabels(v.labels,v.lin), tension:0.25, borderDash:[6,4], borderColor:colors[(ci)%colors.length]+"99"});
+          datasets.push({label:`${u} · WMA`, data:mapToLabels(v.labels,v.wma), tension:0.25, borderDash:[2,4], borderColor:colors[(ci++)%colors.length]+"66"});
+        }
+      });
+
+      if(lineChart) lineChart.destroy();
       lineChart=new Chart(lineCtx,{
         type:'line',
-        data:{
-          labels,
-          datasets:[
-            {label:'LinReg', data:lin, tension:0.25},
-            {label:'WMA', data:wma, tension:0.25},
-            {label:'Ortalama', data:mean, borderWidth:2, tension:0.25}
-          ]
-        },
-        options:{responsive:true, maintainAspectRatio:true, plugins:{legend:{position:'top'}}}
+        data:{labels,datasets},
+        options:{responsive:true, plugins:{legend:{position:'top'}}, spanGaps:true}
       });
       lineBox.classList.remove('d-none');
     }
 
-    function buildBarChart(data, cols){
+    function drawBarLastCapacity(data, cols){
       if(!cols.includes('kapasite')){ barBox.classList.add('d-none'); return; }
-      // son tarih
-      const dates = data.map(r=>r.tarih).map(s=>toDateObj(s)).filter(Boolean);
-      if(!dates.length){ barBox.classList.add('d-none'); return; }
-      const lastTs = new Date(Math.max.apply(null, dates));
-      const lastIso = lastTs.toISOString();
-
-      // last date'e eşit kayıtlar (gün hassasiyeti ile)
-      const lastRows = data.filter(r=>{
-        const d=toDateObj(r.tarih);
-        return d && d.getTime()===lastTs.getTime();
-      });
-
-      // oran hesapla
-      const items = lastRows
-        .map(r=>{
-          const cap = Number(r.kapasite ?? NaN);
-          const val = Number(r.tahmin_mean ?? r.linreg ?? r.wma ?? NaN);
-          const denom = (isFinite(cap) && cap>0) ? cap : NaN;
-          const oran = val && isFinite(denom) ? val/denom : NaN;
-          // etiket: depo/urun varsa birleştir
-          let label = 'seri';
-          if('depo' in r && 'urun' in r) label = `${r.depo} / ${r.urun}`;
-          else if('depo' in r) label = String(r.depo);
-          else if('urun' in r) label = String(r.urun);
-          return {label, oran};
-        })
-        .filter(x=>isFinite(x.oran))
+      const filtered = data.filter(r => !selectedUruns.size || selectedUruns.has(String(r.urun)));
+      if(!filtered.length){ barBox.classList.add('d-none'); return; }
+      const lastTs = new Date(Math.max(...filtered.map(r=>new Date(r.tarih).getTime())));
+      const lastRows = filtered.filter(r=> new Date(r.tarih).getTime()===lastTs.getTime());
+      const items = lastRows.map(r=>{
+        const cap = Number(r.kapasite ?? NaN);
+        const val = Number(r.tahmin_mean ?? r.linreg ?? r.wma ?? NaN);
+        const oran = (isFinite(cap) && cap>0) ? val/cap : NaN;
+        return {label:String(r.urun), oran};
+      }).filter(x=>isFinite(x.oran))
         .sort((a,b)=>b.oran-a.oran)
         .slice(0,10);
 
       if(!items.length){ barBox.classList.add('d-none'); return; }
-
-      if(barChart){ barChart.destroy(); }
+      if(barChart) barChart.destroy();
       barChart=new Chart(barCtx,{
         type:'bar',
         data:{ labels: items.map(i=>i.label), datasets:[{label:'Kullanım Oranı', data: items.map(i=>i.oran)}] },
-        options:{
-          responsive:true,
-          scales:{ y:{ ticks:{ callback:v=>(v*100).toFixed(0)+'%' } } },
-          plugins:{ legend:{display:false} }
-        }
+        options:{ responsive:true, scales:{ y:{ ticks:{ callback:v=>(v*100).toFixed(0)+'%' } } }, plugins:{legend:{display:false}} }
       });
       barBox.classList.remove('d-none');
+    }
+
+    function drawCharts(data){
+      drawLinePerProduct(data);
+      drawBarLastCapacity(data, columns);
     }
 
     form.addEventListener('submit', async (e)=>{
@@ -276,7 +288,6 @@
         if(!res.ok) throw new Error((await res.text()).slice(0,600) || ('HTTP '+res.status));
         const json=await res.json();
 
-        // Badges
         capBadge.textContent = 'Kapasite: ' + json.capacity_source;
         countBadge.textContent = 'Kayıt: ' + json.n_kayit;
         metaBadge.textContent = `h=${json.h}, wma_window=${json.wma_window}`;
@@ -284,17 +295,20 @@
         countBadge.classList.remove('d-none');
         metaBadge.classList.remove('d-none');
 
-        // Tablo
         columns = json.columns||[];
         rows = json.data||[];
+
+        // ürün filtre chip'leri
+        buildChips(uniqueUruns(rows));
+
+        // tablo
         thead.innerHTML = `<tr>${columns.map(c=>`<th class="nowrap">${c}</th>`).join('')}</tr>`;
         page=1; renderTable();
         tableWrap.classList.remove('d-none');
         pager.classList.remove('d-none');
 
-        // Grafikler
-        buildLineChart(rows);
-        buildBarChart(rows, columns);
+        // grafikler
+        drawCharts(rows);
 
       }catch(err){
         alertBox.textContent = err.message || String(err);
@@ -302,6 +316,11 @@
       }
     });
 
+    // ürün görünümü değişince grafikleri tazele
+    stackSwitch.addEventListener('change',()=> drawCharts(rows));
+
+    // tema
+    // already wired above
   </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
