@@ -4,6 +4,7 @@
 
 import os
 import io
+import json
 import warnings
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ from flask import (
     render_template,
     abort,
 )
+from flask.json.provider import DefaultJSONProvider
 
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -23,6 +25,17 @@ from sqlalchemy import create_engine, text
 
 warnings.filterwarnings("ignore")
 app = Flask(__name__)
+
+# --- JSON: NaN/inf temizleyici ---
+class CleanJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        # NaN/Infinity JSON standardında yok; ignore_nan=True → null
+        kwargs.setdefault("ignore_nan", True)
+        return json.dumps(obj, **kwargs)
+    def loads(self, s, **kwargs):
+        return json.loads(s, **kwargs)
+
+app.json = CleanJSONProvider(app)
 
 _LAST_CSV_BYTES = None  # son çıktı cache
 
@@ -149,7 +162,7 @@ def load_capacity_from_db():
     return df
 
 def merge_capacity(forecasts_df, capacity_df, depo_col, urun_col):
-    if capacity_df.empty:
+    if capacity_df is None or capacity_df.empty:
         forecasts_df["kapasite"] = np.nan
         forecasts_df["kullanim_orani"] = np.nan
         return forecasts_df
@@ -254,14 +267,16 @@ def forecast_endpoint():
 
     res_df = run_pipeline(file, h, s, col_date, col_demand, col_depo, col_urun, freq)
 
+    # CSV cache
     csv_buf = io.StringIO()
     res_df.to_csv(csv_buf, index=False)
     _LAST_CSV_BYTES = csv_buf.getvalue().encode("utf-8")
 
+    # JSON güvenli dönüş: NaN/inf → null
     out_df = res_df.copy()
     if "tarih" in out_df.columns:
         out_df["tarih"] = out_df["tarih"].astype(str)
-    out_df = out_df.where(pd.notnull(out_df), None)  # NaN → null
+    out_df = out_df.replace([np.inf, -np.inf], np.nan).where(pd.notnull(out_df), None)
 
     resp = {
         "h": h,
