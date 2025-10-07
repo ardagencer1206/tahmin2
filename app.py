@@ -2,14 +2,17 @@
 # Talep Tahminleme + Kapasite Planlama (SARIMA + Lineer Regresyon)
 # Girdi: talep.xlsx (zorunlu, name=file) + kapasite.xlsx (opsiyonel, name=capfile)
 # UI: templates/index.html  (JS tarafı /forecast dönen charts[]'ı <img src="..."> olarak gösterebilir)
-
+import json
+import matplotlib
+matplotlib.use("Agg")  # headless render
+import matplotlib.pyplot as plt
 import os
 import io
 import warnings
 import base64
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+
 
 from flask import (
     Flask,
