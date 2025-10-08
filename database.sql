@@ -1,0 +1,21 @@
+-- Uygulamanın zaten kullandığı tablo
+CREATE TABLE IF NOT EXISTS forecast_results (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  run_id CHAR(36) NOT NULL,
+  tarih DATETIME NULL,
+  urun VARCHAR(255) NOT NULL,
+  linreg DOUBLE NULL,
+  wma DOUBLE NULL,
+  tahmin_mean DOUBLE NULL,
+  kapasite DOUBLE NULL,
+  kullanim_orani DOUBLE NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Kullanıcılar
+CREATE TABLE IF NOT EXISTS users (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
