@@ -9,6 +9,12 @@ import pymysql
 warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
+
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-me")  # oturum için
+from log_register import auth_bp
+
+app.register_blueprint(auth_bp)
+
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
 
 # -------- ENV (Railway Variables) --------
