@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Kayıt</title>
+<link rel="stylesheet" href="https://unpkg.com/missing.css">
+<section class="container">
+  <h1>Kayıt</h1>
+  <form method="post" action="{{ url_for('auth.register') }}">
+    <label>E-posta
+      <input type="email" name="email" required>
+    </label>
+    <label>Şifre
+      <input type="password" name="password" required minlength="6">
+    </label>
+    <button type="submit">Kayıt ol</button>
+  </form>
+  <p>Zaten hesabın var mı? <a href="{{ url_for('auth.login') }}">Giriş yap</a></p>
+</section>
